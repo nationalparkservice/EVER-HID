@@ -1,0 +1,675 @@
+---
+title: "Hole-in-the-Donut Visualizer"
+output:
+  flexdashboard::flex_dashboard:
+    theme: yeti
+    orientation: columns
+runtime: shiny
+---
+
+```{r global, include=FALSE}
+
+rm(list=ls())
+
+### Load libraries -----
+# Will automatically install any libraries it can't find
+packages <- c("flexdashboard", 
+              "shiny", 
+              "knitr",  
+              "leaflet", 
+              "plotly", 
+              "here",
+             "readxl",
+             "tidyverse",
+             "shinyWidgets", # for slider text inputs
+             "ggridges", # for ridgeline plots
+             "gridExtra", # for arranging plots
+             "magrittr",
+             "RColorBrewer",
+             "rgdal",
+             "DT",
+             "reactable" # for reactive data tables
+)
+
+package.check <- lapply(packages, FUN = function(x) {
+  if (!require(x, character.only = TRUE)) {
+    install.packages(x, dependencies = TRUE, repos = "http://cran.us.r-project.org")
+    library(x, character.only = TRUE)
+  }
+})
+options(shiny.maxRequestSize = 20*1024^2) # allows data files up to 20 MB to be imported
+
+# options(shiny.maxRequestSize = 20*1024^2, 
+#         timeout = 300,
+#         stringsAsFactors = FALSE,
+#         DT.options = list(
+#           hover = TRUE,
+#           scrollX = TRUE,
+#           scrollY = TRUE,
+#           autoWidth = FALSE),
+#         # Header width doesn't match body width when this is set to TRUE. To fix, would need to include code to recalculate widths only after a tab is visible. If setting column widths, need to set autoWidth to TRUE
+#         dplyr.summarise.inform = FALSE
+# )
+
+```
+
+```{r startup}
+rv <- reactiveValues(
+  dat = NULL,
+  df_SpeciesList = NULL,
+  map_HIDpoly = NULL,
+  map_HIDplots = NULL,
+  BlockSummaries = NULL
+)
+
+cbp1 <- c("#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#0072B2", "#D55E00", "#999999", "#F0E442", "#000000", "chocolate4", "purple4", "chartreuse", "lightpink", "honeydew2") # Colorblind-friendly palette
+  
+```
+
+```{r css}
+# This expands maps to fill screen
+tags$style("map {
+           height: calc(100vh - 80px) !important;
+           }")
+
+# Add left margin padding on columns
+tags$style(".dashboard-column {
+    padding-left: 10px;
+}")
+
+# Add padding on plotly figures
+tags$style(".js-plotly-plot .plotly, .js-plotly-plot .plotly div {
+    padding: 10px;
+}")
+
+# This allows renderTables to scroll when overflow
+tags$style(".chart-wrapper {
+  overflow-x:scroll;
+  overflow-y:scroll;
+}")
+
+tags$style("table.dataTable tbody th, table.dataTable tbody td input.form-control {
+    padding: 2px 5px; 
+}") # reduce padding in data tables
+
+
+tags$style(".rank-list-title {
+  font-size:14px;
+  padding:4px;
+}")
+
+tags$style(".reactable {
+font-size: 14px; 
+}") # font size for reactable tables
+
+tag.map.title <- tags$style(HTML("
+  .leaflet-control.map-title { 
+    transform: translate(-50%,20%);
+    position: fixed !important;
+    left: 50%;
+    text-align: center;
+    padding-left: 10px; 
+    padding-right: 10px; 
+    background: rgba(255,255,255,0.75);
+    font-weight: bold;
+    font-size: 28px;
+  }
+")) # add title to leaflet map
+
+```
+
+```{r functions}
+
+### FUNCTIONS ----
+FuncBootMean = function(x,B=1000, lowerCI=0.05, upperCI=0.95) {
+n = length(x)
+boot.samples = matrix( sample(x,size=n*B,replace=TRUE), B, n)
+boot.statistics = apply(boot.samples,1,mean)
+
+lowerCI = round(quantile(boot.statistics, probs = c(lowerCI), na.rm = TRUE), 2)
+upperCI = round(quantile(boot.statistics, probs = c(upperCI), na.rm = TRUE), 2)
+return(data.frame(lowerCI = lowerCI, upperCI = upperCI))
+}
+
+FuncBlockSummaries <- function(dat, dat_SpeciesList) {
+  df1 <- dat %>%
+    dplyr::group_by(BlockID, EventNum, Yr) %>%
+    dplyr::summarize(
+      MeanExotics = round(mean(ExoticTotCov, na.rm = TRUE), 2),
+      MeanNuisance = round(mean(NuisanceTotCov, na.rm = TRUE), 2),
+      NumPlots = n())
+  df_rich <- dat_SpeciesList %>%
+    dplyr::group_by(BlockID, EventNum, Yr) %>%
+    dplyr::summarize(SpeciesRich = n_distinct(SpCode))
+  df_BlockSummaries <- df1 %>%
+    dplyr::full_join(df_rich, by = c("BlockID", "EventNum", "Yr")) %>%
+    dplyr::rename("ExoticTotCov" = "MeanExotics", "NuisanceTotCov" = "MeanNuisance") %>%
+    ungroup() %>%
+    dplyr::select(BlockID, Yr, EventNum, NumPlots, ExoticTotCov, NuisanceTotCov, SpeciesRich)# arrange columns in this order
+    
+return(df_BlockSummaries)
+}
+
+# This is a 'reactable' function
+with_tooltip <- function(value, tooltip) {
+  tags$abbr(style = "text-decoration: underline; text-decoration-style: dotted; cursor: help", title = tooltip, value)
+}
+
+FuncAddThresh <- function(p, p_xmin = NULL, p_xmax, p_ymax, metric, hist_plot = FALSE) {
+  # Function to add threshold background color for histograms
+  #
+  # Args:
+  #   p: Base plot
+  #   metric: Metric to plot
+  #
+  # Returns:
+  #   Plot with threshold background
+  #
+  thresh <- switch(metric,
+                   "ExoticTotCov" = 2,
+                   "NuisanceTotCov" = 15,
+                   "SpeciesRich" = 70)
+  if(metric == "SpeciesRich") {
+    high_col <- "#56B4E9"
+    low_col <- "#E69F00"
+  } else {
+    high_col <- "#E69F00"
+    low_col <- "#56B4E9"
+  }
+  
+  xlim <- 1.1*max(p_xmax, thresh)
+  ylim <- 1.1*max(p_ymax, thresh)
+  
+  if(hist_plot == TRUE) { # for histograms
+    p <- p +
+      geom_rect(data = data.frame(xmin = p_xmin, xmax = thresh, ymin = 0, ymax = 1.1*p_ymax), aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax), fill = low_col, alpha = 0.25, show.legend = FALSE, inherit.aes = FALSE) +
+      geom_rect(data = data.frame(xmin = thresh, xmax = xlim, ymin = 0, ymax = 1.1*p_ymax), aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax), fill = high_col, alpha = 0.25, show.legend = FALSE, inherit.aes = FALSE)
+    
+  } else { # for all other plots
+    p <- p +
+      geom_rect(data = data.frame(xmin = 0, xmax = 1.1*p_xmax, ymin = 0, ymax = thresh), aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax), fill = low_col, alpha = 0.25, show.legend = FALSE, inherit.aes = FALSE) +
+      geom_rect(data = data.frame(xmin = 0, xmax = 1.1*p_xmax, ymin = thresh, ymax = ylim), aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax), fill = high_col, alpha = 0.25, show.legend = FALSE, inherit.aes = FALSE)
+  }
+  return(p)
+}
+
+FuncPlotlyScatter <- function(dat, selectedBlock, selectedMetric, trans_y = "identity") {
+  # Function to generate scatterplot of data
+  #
+  # Args:
+  #   dat:  A data frame with the raw data
+  #   selectedBlock, selectedMetric: Data filters
+  #   trans_y: Transformation to apply to y axis
+  #
+  # Returns:
+  #   List of scatterplot
+  # 
+
+  # Create the plot
+    p_point <- 
+      ggplot(data = dat %>% dplyr::filter(BlockID %in% selectedBlock), aes_string(x = "EventNum", y = selectedMetric, color = "PlotID", text = "Yr")) +
+      geom_jitter(aes(fill = PlotID, color = PlotID), size = 2, alpha = 0.8, show.legend = c(fill = TRUE, color = FALSE, shape = FALSE)) +
+  scale_x_continuous(breaks = c(1:5, 7, 10, 15, 20, 25, 30)) +
+  labs(title = paste0(selectedBlock, ": ", selectedMetric), 
+       subtitle = "Each line represents a plot",
+       y = paste0(selectedMetric, " %"),
+       x = "Years since scrape") + 
+        theme_bw() +
+        theme(legend.position = "none") +
+      facet_wrap(BlockID, ncol = 3) +
+      theme(strip.text = element_text(size = 14))
+    
+    out_plotly <- ggplotly(p_point)
+    
+  return(out_plotly)
+}
+
+```
+
+```{r action_buttons}
+
+# Generic action to cancel modal ----
+observeEvent(eventExpr = input$button_CancelModal, {
+  removeModal()
+  })
+
+# (Home) Load data as RDS ----
+observeEvent(eventExpr = input$button_LoadRDS, {
+  showModal(modalDialog(
+    fileInput("saved_data_file", label = "Import data already formatted for dashboard use ('RDS' extension)", placeholder = "Click 'Browse...' button then navigate to file", accept = c('.RDS'), width = "100%"),
+    footer = tagList(
+      modalButton("Cancel")
+    )
+  ))
+})
+
+observeEvent(eventExpr = input$saved_data_file, {
+  tryCatch(out <- readRDS(input$saved_data_file$datapath),
+           error = function(e) print("Cannot import the selected file"))
+  if(class(out)!="list") {
+    showModal(modalDialog(
+    title = "Error",
+    "Cannot import the selected file. Please try a different .RDS file."
+    ))
+    }
+  
+  shiny::req(!is.null(out))
+
+  for(i in c("dat", "df_SpeciesList", "map_HIDpoly", "map_HIDplots")) {
+    if(!is.null(out[[i]])) {
+    rv[[i]] <- out[[i]] # load the data in the dashboard
+    }
+  }
+    rv[["BlockSummaries"]] <- FuncBlockSummaries(dat = rv$dat, dat_SpeciesList = rv$df_SpeciesList)
+
+  Sys.sleep(0.25)
+  showModal(modalDialog(
+  title = "Done",
+  "The map below shows Hole-in-the-Donut project restoration blocks. You may now view data summaries in the other dashboard tabs."
+  ))
+})
+```
+
+    
+HOME
+=========================================
+
+Column {data-width=100}
+-------------------------------------
+
+#### <font size="5">Everglades National Park Hole-in-the-Donut Monitoring</font> 
+
+<font size="4"> 
+This dashboard is an interactive tool for visualizing monitoring data collected since 2001 for the Everglades National Park Hole-in-the-Donut (HID) restoration project. Hover over data points in maps or graphs to see summary information. All tables and graphs can be exported as .csv and .png files, respectively.</font>
+
+```{r}
+actionButton("button_ImportCSV", "Import New Data",
+             style="color:black; background-color: lightgreen; border:2px; margin:5px; width:200px; display:inline-block;")
+
+actionButton("button_LoadRDS", "Load an Existing RDS File",
+             style="color:black; background-color: lightgreen; border:2px; margin:5px; width:230px; display:inline-block;")
+
+```
+
+
+```{r mainMap}
+# Main project map, color-coded and labelled by year of restoration
+# For this one, include all plots even pre-2011
+
+output$out_MainMap <- renderLeaflet({
+  shiny::req(!is.null(rv$dat), !is.null(rv$map_HIDpoly))
+  
+  pal<-colorFactor(palette ="YlGnBu", domain = rv$map_HIDpoly$YrRestored)
+  
+  map<-leaflet() %>% 
+    addProviderTiles("Esri.WorldImagery", options = providerTileOptions(noWrap = TRUE), group="Satellite") %>%
+    addPolygons(data = rv$map_HIDpoly, label = ~BlockID, color = "black", weight = 1, fillColor = ~pal(YrRestored), fillOpacity = 0.5) %>% 
+    addLegend(title = "Restoration Yr", pal = pal, values = rv$map_HIDpoly$YrRestored)
+  
+  map  
+  })
+
+tags$style("#out_MainMap {height: calc(100vh - 100px) !important;}")
+leafletOutput('out_MainMap', height="100%", width = "100%")
+```
+
+Big Picture
+====================================== 
+
+Column {data-width=100 .tabset .tabset-fade}
+-------------------------------------
+####
+```{r mainInput}  
+renderUI({
+  shiny::req(!is.null(rv$dat))
+  selectInput(
+    "sel_MainMetric",
+    label = "Select a Metric: ",
+    choices = c("% exotic cover" = "ExoticTotCov", "% nuisance cover" = "NuisanceTotCov", "Species richness" = "SpeciesRich"),
+    selected = switch(is.null(input$sel_MainMetric)+1, input$sel_MainMetric, "ExoticTotCov")
+    )
+  })
+```
+
+### Line Plots
+
+```{r mainLinePlots}
+renderPlotly({
+  shiny::req(!is.null(rv$BlockSummaries), !is.null(input$sel_MainMetric))
+  
+  # pal <- colorNumeric(palette = "YlGnBu", domain = rv$BlockSummaries$BlockID)
+  
+  p_line <- ggplot(
+    data = rv$BlockSummaries, aes_string(x = "EventNum", y = input$sel_MainMetric, color = "BlockID", text = "Yr")) # %>% dplyr::mutate(HoverLabel = paste0(BlockID, "<br>", get(input$sel_MainMetric),"<br>Survey year: ", Yr, "<br>Years since scrape: ", EventNum, "<br># of Plots: ", NumPlots))
+  
+  p_line <- FuncAddThresh(p = p_line, p_xmax = max(rv$BlockSummaries$EventNum, na.rm = TRUE), p_ymax = max(rv$BlockSummaries[[input$sel_MainMetric]], na.rm = TRUE), metric = input$sel_MainMetric, hist_plot = FALSE)
+  
+  p_line <- p_line +
+    geom_line(size = 1.1) +
+    scale_x_continuous(breaks = sort(unique(rv$BlockSummaries$EventNum))) +
+    scale_color_viridis_d(direction = -1) +
+    labs(title = switch(input$sel_MainMetric,
+                        "ExoticTotCov" = "% Exotic Cover. Target is <= 2% mean cover (blue background).",
+                        "NuisanceTotCov" = "% Nuisance Cover. Target is <= 15% mean cover (blue background).", 
+                        "SpeciesRich" = "Native Species Richness. Target is >= 70 species summed across blocks (blue background)."),
+         y = switch(input$sel_MainMetric, 
+                    "ExoticTotCov" = "% Exotic Cover, Averaged Across Plots",
+                    "NuisanceTotCov" = "% Nuisance Cover, Averaged Across Plots",
+                    "SpeciesRich" = "# of Native Species (Species Richness)"),
+         x = "Years since scrape") +
+    theme_bw()
+  
+  ggplotly(p_line)
+})
+```
+
+### Histograms
+
+```{r mainHistograms}
+# Known problem with plotly on faceted plots --sides are cut off
+renderPlotly({
+  shiny::req(!is.null(rv$BlockSummaries), !is.null(input$sel_MainMetric))
+
+  p_hist <- ggplot(data = rv$BlockSummaries, aes_string(x = input$sel_MainMetric)) 
+  p_hist_tocount <- p_hist +
+    geom_histogram(bins = 12) +
+    facet_wrap(~EventNum) 
+  
+  # New facet label names 
+  facet_labs <- paste0("Years since scrape: ", sort(unique(rv$BlockSummaries$EventNum)))
+  names(facet_labs) <- sort(unique(rv$BlockSummaries$EventNum))
+
+  p_hist <- FuncAddThresh(p = p_hist, p_xmin = min(ggplot_build(p_hist_tocount)$data[[1]]$xmin, na.rm = TRUE), p_xmax = max(ggplot_build(p_hist_tocount)$data[[1]]$xmax, na.rm = TRUE), p_ymax = max(ggplot_build(p_hist_tocount)$data[[1]]$ymax, na.rm = TRUE), metric = input$sel_MainMetric, hist_plot = TRUE)
+  
+  p_hist <- p_hist +
+    geom_histogram(bins = 12, color = "black", fill = "gray") +
+    labs(title = switch(input$sel_MainMetric,
+                        "ExoticTotCov" = "% Exotic Cover. Target is <= 2% mean cover (blue background). Bar height is # of blocks.",
+                        "NuisanceTotCov" = "% Nuisance Cover. Target is <= 15% mean cover (blue background). Bar height is # of blocks.", 
+                        "SpeciesRich" = "Native Species Richness. Target is >= 70 distinct species (blue background). Bar height is # of blocks."),
+         x = switch(input$sel_MainMetric, 
+                    "ExoticTotCov" = "% Exotic Cover (Distribution of Restoration Block Means)",
+                    "NuisanceTotCov" = "% Nuisance Cover (Distribution of Restoration Block Means)",
+                    "SpeciesRich" = "# of Native Species in Restoration Blocks (Species Richness)"),
+       y = "Count of restoration blocks") +
+  theme_bw() +
+    facet_wrap(~EventNum, dir = "h", ncol = 3, labeller = labeller(EventNum = facet_labs)) +
+    theme(strip.text = element_text(size = 12))
+
+  ggplotly(p_hist)
+})
+```
+
+### Summary (All Metrics)
+
+```{r mainCI}
+output$CI_tbl <- renderReactable({
+  shiny::req(!is.null(rv$dat), !is.null(rv$BlockSummaries))
+  
+  boot_Exotic <- rv$dat %>%
+  group_by(EventNum) %>%
+  group_modify(~
+    FuncBootMean(x = .x$ExoticTotCov)) %>%
+    dplyr::rename(Exotics_lower95CI = lowerCI, Exotics_upper95CI = upperCI)
+  boot_Nuisance <- rv$dat %>%
+  group_by(EventNum) %>%
+  group_modify(~
+    FuncBootMean(x = .x$NuisanceTotCov)) %>%
+    dplyr::rename(Nuisance_lower95CI = lowerCI, Nuisance_upper95CI = upperCI)
+  temp_EventMeans <- rv$dat %>%
+    group_by(EventNum) %>%
+    dplyr::summarize(
+      NumBlocks = length(unique(BlockID)),
+      NumPlots = n(),
+      ExoticTotCov = round(mean(ExoticTotCov, na.rm = TRUE), 2),
+      NuisanceTotCov = round(mean(NuisanceTotCov, na.rm = TRUE), 2)
+    )
+  
+  CIsummary <- temp_EventMeans %>%
+    dplyr::left_join(boot_Exotic, by = "EventNum") %>%
+    dplyr::left_join(boot_Nuisance, by = "EventNum") %>%
+    dplyr::select(EventNum, NumBlocks, NumPlots, Exotics_lower95CI, ExoticTotCov, Exotics_upper95CI, Nuisance_lower95CI, NuisanceTotCov, Nuisance_upper95CI)
+    
+  reactable(
+    CIsummary,
+    columns = list(
+      EventNum = colDef(header = with_tooltip("Event", "# of years since scrape"), align = "center"),
+      NumBlocks = colDef(header = with_tooltip("# of Restoration Blocks", "# of restoration blocks included in calculations"), align = "center"),
+      NumPlots = colDef(header = with_tooltip("# of Plots", "# of survey plots included in calculations"), align = "center"),
+      Exotics_lower95CI = colDef(header = with_tooltip("Lower 95%CI", "bootstrapped lower 95% confidence interval for exotic species cover"), align = "center", style = function(value) {
+        color <- ifelse(value <=2, "#56B4E9", "#E69F00")
+        list(background = color)
+      }),
+      ExoticTotCov = colDef(header = with_tooltip("Mean % Cover", "% exotic species cover, averaged across plots"), align = "center", style = function(value) {
+        color <- ifelse(value <=2, "#56B4E9", "#E69F00")
+        list(background = color)
+      }),
+      Exotics_upper95CI = colDef(header = with_tooltip("Upper 95%CI", "bootstrapped upper 95% confidence interval for exotic species cover"), align = "center", style = function(value) {
+        color <- ifelse(value <=2, "#56B4E9", "#E69F00")
+        list(background = color)
+      }),
+            Nuisance_lower95CI = colDef(header = with_tooltip("Lower 95%CI", "bootstrapped lower 95% confidence interval for nuisance species cover"), align = "center", style = function(value) {
+        color <- ifelse(value <=15, "#56B4E9", "#E69F00")
+        list(background = color)
+      }),
+            NuisanceTotCov = colDef(header = with_tooltip("Mean % Cover", "% nuisance species cover, averaged across plots"), align = "center", style = function(value) {
+        color <- ifelse(value <=15, "#56B4E9", "#E69F00")
+        list(background = color)
+      }),
+            Nuisance_upper95CI = colDef(header = with_tooltip("% Upper 95%CI", "bootstrapped upper 95% confidence interval for nuisance species cover"), align = "center", style = function(value) {
+        color <- ifelse(value <=15, "#56B4E9", "#E69F00")
+        list(background = color)
+      })),
+      columnGroups = list(
+      colGroup(name = "% Exotic Cover", columns = c("ExoticTotCov", "Exotics_lower95CI", "Exotics_upper95CI")),
+      colGroup(name = "% Nuisance Cover", columns = c("NuisanceTotCov", "Nuisance_lower95CI", "Nuisance_upper95CI"))
+      ),
+    resizable = TRUE, 
+    filterable = TRUE,
+    striped = FALSE,
+    highlight = TRUE,
+    showSortIcon = TRUE,
+    compact = FALSE,
+    bordered = TRUE,
+    showPageSizeOptions = TRUE)
+})
+reactableOutput("CI_tbl")
+tags$style("#CI_tbl{height:100vh;overflow-x:scroll;overflow-y:scroll}")
+```
+
+### Data (All Metrics)
+```{r mainData}
+output$summary_tbl <- renderReactable({
+  shiny::req(!is.null(rv$dat), !is.null(rv$BlockSummaries))
+    
+  reactable(
+    rv$BlockSummaries,
+    columns = list(
+      BlockID = colDef(name = "Block ID", align = "center"),
+      Yr = colDef(name = "Year", align = "center"),
+      EventNum = colDef(header = with_tooltip("Event", "# of years since scrape"), align = "center"),
+      NumPlots = colDef(header = with_tooltip("# of Plots", "# of survey plots in restoration block"), align = "center"),
+      ExoticTotCov = colDef(header = with_tooltip("% Exotic Cover", "% exotic species cover, averaged across plots"), align = "center", style = function(value) {
+        color <- ifelse(value <=2, "#56B4E9", "#E69F00")
+        list(background = color)
+      }),
+      NuisanceTotCov = colDef(header = with_tooltip("% Nuisance Cover", "% nuisance species cover, averaged across plots"), align = "center", style = function(value) {
+        color <- ifelse(value <=15, "#56B4E9", "#E69F00")
+        list(background = color)
+      }),
+      SpeciesRich = colDef(header = with_tooltip("Native Species Richness", "# of distinct native plant species observed in restoration block"), align = "center", style = function(value) {
+        color <- ifelse(value >=70, "#56B4E9", "#E69F00")
+        list(background = color)
+      })
+    ),
+    details = function(index) {
+      data_by_plot <- rv$dat[rv$dat$BlockID == rv$BlockSummaries$BlockID[index] & rv$dat$Yr == rv$BlockSummaries$Yr[index], ] %>%
+        dplyr::select(BlockID, Yr, PlotID, ExoticTotCov, NuisanceTotCov, PlotRich)
+      htmltools::div(style = "padding: 50px",
+                     reactable(data_by_plot,
+                               columns = list(
+                                 BlockID = colDef(show = FALSE),
+                                 Yr = colDef(show = FALSE),
+                                 PlotID = colDef(name = "Plot ID", align = "center"),
+                               ExoticTotCov = colDef(header = with_tooltip("% Exotic Cover", "% exotic species cover (denominator is plot area)"), align = "center", style = function(value) {
+      color <- ifelse(value <=2, "#56B4E9", "#E69F00")
+      list(background = color)
+    }),
+                               NuisanceTotCov = colDef(header = with_tooltip("% Nuisance Cover", "% nuisance species cover (denominator is plot area)"), align = "center", style = function(value) {
+      color <- ifelse(value <=15, "#56B4E9", "#E69F00")
+      list(background = color)
+    }),
+                               PlotRich = colDef(header = with_tooltip("Native Species Richness", "# of distinct native plant species observed in plot"), align = "center")
+    ),
+      defaultSorted = list(PlotID = "asc"),
+                               resizable = TRUE,
+                               filterable = TRUE,
+                               striped = FALSE,
+                               highlight = TRUE,
+                               showSortIcon = TRUE,
+                               compact = TRUE,
+                               pagination = FALSE,
+                               outlined = FALSE,
+                               bordered = FALSE,
+                               theme = reactableTheme(backgroundColor = "hsl(186, 56%, 94%)")
+                           )
+      )
+    },
+    resizable = TRUE, 
+    filterable = TRUE,
+    striped = FALSE,
+    highlight = TRUE,
+    showSortIcon = TRUE,
+    compact = FALSE,
+    bordered = TRUE,
+    showPageSizeOptions = TRUE)
+})
+reactableOutput("summary_tbl")
+tags$style("#summary_tbl{height:100vh;overflow-x:scroll;overflow-y:scroll}")
+```
+
+Block Summaries
+====================================== 
+
+Inputs {.sidebar data-width=300}
+-------------------------------------
+```{r inputBlock}  
+
+renderUI({
+  shiny::req(!is.null(rv$dat))
+  selectInput(
+    "sel_Block",
+    label = "Select a Restoration Block: ",
+    choices = sort(unique(rv$dat$BlockID)),
+    selected = switch(is.null(input$sel_Block)+1, input$sel_Block, sort(unique(rv$dat$BlockID))[1])
+    )
+  })
+
+renderUI({
+  shiny::req(!is.null(rv$dat))
+  selectInput(
+    "sel_BlockMetric",
+    label = "Select a Metric to Plot: ",
+    choices = c("% exotic cover" = "ExoticTotCov", "% nuisance cover" = "NuisanceTotCov"),
+    selected = switch(is.null(input$sel_BlockMetric)+1, input$sel_BlockMetric, "ExoticTotCov")
+    )
+  })
+
+renderUI({
+  shiny::req(!is.null(rv$dat), !is.null(input$sel_Block))
+  events <- as.character(sort(unique(rv$dat %>% filter(BlockID == input$sel_Block) %>% pull(EventNum))))
+  sliderTextInput("sel_YrsPost", force_edges = TRUE, label = h6("Select the number of years post-scrape"), choices = events, selected = events[1], dragRange = FALSE, animate = TRUE, width = "85%")
+  })
+
+```
+
+
+Plots - Output {.tabset .tabset-fade}
+-------------------------------------
+### Block Plots
+#### 
+```{r blockLine}
+# Line plot
+renderPlotly({
+  shiny::req(!is.null(rv$dat), !is.null(input$sel_Block), !is.null(input$sel_BlockMetric))
+  line_subdat <- subset(rv$dat, BlockID == input$sel_Block)
+
+  pb_line <- ggplot(
+    data = line_subdat, aes_string(x = "EventNum", y = input$sel_BlockMetric, color = "PlotID", text = "Yr")) # %>% dplyr::mutate(HoverLabel = paste0(BlockID, "<br>", get(input$sel_MainMetric),"<br>Survey year: ", Yr, "<br>Years since scrape: ", EventNum, "<br># of Plots: ", NumPlots))
+  
+  if(input$sel_BlockMetric %in% c("ExoticTotCov", "NuisanceTotCov")) {
+    pb_line <- FuncAddThresh(p = pb_line, p_xmax = max(line_subdat$EventNum, na.rm = TRUE), p_ymax = max(line_subdat[[input$sel_BlockMetric]], na.rm = TRUE), metric = input$sel_BlockMetric, hist_plot = FALSE)
+  }
+  
+  pb_line <- pb_line +
+    geom_line(size = 1.1) +
+    scale_x_continuous(breaks = sort(unique(line_subdat$EventNum))) +
+    scale_color_viridis_d(direction = -1) +
+    labs(title = switch(input$sel_BlockMetric,
+                        "ExoticTotCov" = "% Exotic Cover. Target is <= 2% mean cover (blue background).",
+                        "NuisanceTotCov" = "% Nuisance Cover. Target is <= 15% mean cover (blue background).", 
+                        "SpeciesRich" = "Native Species Richness"),
+         y = switch(input$sel_BlockMetric, 
+                    "ExoticTotCov" = "% Exotic Cover",
+                    "NuisanceTotCov" = "% Nuisance Cover",
+                    "SpeciesRich" = "# of Native Species (Species Richness)"),
+         x = "Years since scrape") +
+    theme_bw()
+  
+  ggplotly(pb_line)
+})
+```
+
+#### 
+```{r blockBox}
+# Box plot
+renderPlotly({
+  shiny::req(!is.null(rv$dat), !is.null(input$sel_Block), !is.null(input$sel_BlockMetric))
+  subdat <- subset(rv$dat, BlockID == input$sel_Block) 
+  
+  pb_box <- ggplot(
+    data = subdat, aes_string(x = "as.factor(EventNum)", y = input$sel_BlockMetric, text = "Yr")) +
+    geom_boxplot() +
+    labs(title = switch(input$sel_BlockMetric,
+                        "ExoticTotCov" = "% Exotic Cover. Target is <= 2% mean cover.",
+                        "NuisanceTotCov" = "% Nuisance Cover. Target is <= 15% mean cover.", 
+                        "SpeciesRich" = "Native Species Richness"),
+         y = switch(input$sel_BlockMetric, 
+                    "ExoticTotCov" = "% Exotic Cover",
+                    "NuisanceTotCov" = "% Nuisance Cover",
+                    "SpeciesRich" = "# of Native Species (Species Richness)"),
+         x = "Years since scrape") +
+    theme_bw()
+  
+  # if(input$sel_BlockMetric %in% c("ExoticTotCov", "NuisanceTotCov")) {
+  #   pb_box <- FuncAddThresh(p = pb_box, p_xmax = length(unique(subdat$EventNum)), p_ymax = max(subdat[[input$sel_BlockMetric]], na.rm = TRUE), metric = input$sel_BlockMetric, hist_plot = FALSE)
+  #   }
+    
+})
+```  
+
+### Maps
+```{r blockMaps}
+output$out_BlockMap <- renderLeaflet({
+  shiny::req(!is.null(rv$dat), !is.null(rv$map_HIDpoly), !is.null(input$sel_Block), !is.null(input$sel_BlockMetric), !is.null(input$sel_YrsPost))
+  
+blockdat <- subset(rv$dat, BlockID == input$sel_Block) %>%
+  dplyr::rename(Metric = input$sel_BlockMetric)
+blocksubdat <- subset(rv$dat, BlockID == input$sel_Block) %>%
+  dplyr::rename(Metric = input$sel_BlockMetric)%>%
+    dplyr::filter(EventNum == as.numeric(input$sel_YrsPost))
+
+palNumeric <- colorNumeric(palette = "YlGnBu", domain = blockdat$Metric)
+
+  blockmap<-leaflet() %>%
+    addPolygons(data = subset(rv$map_HIDpoly, BlockID == input$sel_Block), color = "black", weight = 1, fillOpacity = 0) %>%
+    addCircleMarkers(data = blocksubdat, lat = ~Latitude, lng = ~Longitude, label = ~PlotID, radius = 15, fillColor = ~palNumeric(Metric), fillOpacity = 1, stroke = FALSE, opacity = 1) %>%
+    addControl(tags$div(tag.map.title, HTML(input$sel_BlockMetric, " for ", input$sel_Block, "Years since scrape: ", input$sel_YrsPost, " (Yr ", unique(blocksubdat$Yr), ")")), position = "topleft", className="map-title") %>%
+    addLegend(pal = palNumeric, values = blockdat$Metric, position = "topright", title = input$sel_BlockMetric)
+
+  blockmap
+  })
+
+tags$style("#out_BlockMap {height: calc(100vh - 100px) !important;}")
+leafletOutput('out_BlockMap', height="100%", width = "100%")
+```
